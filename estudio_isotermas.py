@@ -679,7 +679,7 @@ def comparar_parametros_entre_condiciones(res_por_cond, mejores):
                     print(f"  {cond}: {direccion} {cambio:+.1f}%")
 # ═════════════ 7. MAIN ═════════════
 if __name__ == "__main__":
-    CSV_PATH = r"C:/Users/Lucas/Documents/CNEA/Latex/Informe de Avance 2026-2027/python\DatosIsoterma-DI.csv"
+    CSV_PATH = r"DatosIsoterma-DI.csv"
     
     # Cargar datos
     df_stats, df_ajuste = cargar_y_agrupar_replicas(CSV_PATH)
