@@ -91,7 +91,7 @@ def valido_fisico(nombre, p):
 
 def aceptable(r):
     return (r['success'] and r['valido'] and r['R2'] > 0.5
-            and np.isfinite(r['chi2_red']) and r['chi2_red'] < 20)
+            and np.isfinite(r['chi2_red']) and r['chi2_red'] < 25)
 
 def bootstrap_parametros(df_cond, cfg, popt, B=500, seed=42, parametrico=True):
     """IC bootstrap de los parámetros de un modelo ya ajustado."""
@@ -317,8 +317,11 @@ def ajustar_modelos_por_condicion(df_ajuste, seed=2026):
     out_por_cond = {}
     for cond, sub in df_ajuste.groupby('condicion'):
         Ce, Qe   = sub.Ce_raw.values, sub.Qe_raw.values
-        sCe_safe = np.maximum(sub.Ce_std.values, 0.01*np.abs(Ce) + 1e-6)
-        sQe_safe = np.maximum(sub.Qe_std.values, 0.05*np.abs(Qe) + 1e-6)
+        #sCe_safe = np.maximum(sub.Ce_std.values, 0.01*np.abs(Ce) + 1e-6)
+        #sQe_safe = np.maximum(sub.Qe_std.values, 0.05*np.abs(Qe) + 1e-6)
+        # Usar directamente Ce_std y Qe_std calculados de las réplicas
+        sCe_safe = np.maximum(sub.Ce_std.values, 1e-6)
+        sQe_safe = np.maximum(sub.Qe_std.values, 1e-6)
         data = RealData(Ce, Qe, sx=sCe_safe, sy=sQe_safe)
         print(f"\n📐 {cond}: {len(Ce)} réplicas")
         resultados = {}
@@ -677,6 +680,99 @@ def comparar_parametros_entre_condiciones(res_por_cond, mejores):
                 for cond, cambio in cambios:
                     direccion = "↓" if cambio < 0 else "↑"
                     print(f"  {cond}: {direccion} {cambio:+.1f}%")
+
+def graficar_residuos(df_stats, res_por_cond, mejores):
+    """Residuos vs Ce predicho para el modelo ganador."""
+    fig, axes = plt.subplots(1, len(mejores), figsize=(15, 5))
+    if len(mejores) == 1:
+        axes = [axes]
+    
+    for ax, (cond, nombre) in zip(axes, mejores.items()):
+        r = res_por_cond[cond][nombre]
+        sub = df_stats[df_stats.condicion == cond]
+        Ce_pred = r['func'](sub.Ce_mean.values, *r['popt'])
+        residuos = sub.Qe_mean.values - Ce_pred
+        
+        ax.scatter(Ce_pred, residuos, alpha=0.7)
+        ax.axhline(0, color='red', ls='--')
+        ax.set_xlabel('$q_e$ predicho (µg/g)')
+        ax.set_ylabel('Residuo (µg/g)')
+        ax.set_title(f'{cond} - {nombre}')
+        ax.grid(ls='--', alpha=0.5)
+    
+    plt.tight_layout()
+    plt.savefig('residuos_modelo.png', dpi=300)
+    plt.show()
+
+R = 8.314  # J/(mol·K)
+T = 298.15  # K
+KL_DI = 0.02771  # L/µg
+KL_NaCl = 0.05756
+KL_Natural = 0.001769
+# Convertir a L/mol (masa molar As = 74.92 g/mol)
+factor = 74.92 * 1e6  # µg/g → g/mol
+KL_DI_mol = KL_DI * factor
+KL_NaCl_mol = KL_NaCl * factor
+KL_Natural_mol = KL_Natural * factor
+# Energía libre de adsorción
+dG_DI = -R * T * np.log(KL_DI_mol)
+dG_NaCl = -R * T * np.log(KL_NaCl_mol)
+dG_Natural = -R * T * np.log(KL_Natural_mol)
+print(f"ΔG° adsorción:")
+print(f"  DI:      {dG_DI/1000:.2f} kJ/mol")
+print(f"  NaCl:    {dG_NaCl/1000:.2f} kJ/mol")
+print(f"  Natural: {dG_Natural/1000:.2f} kJ/mol")
+from scipy.optimize import fsolve
+import numpy as np
+def sips(Ce, Qmax, KL, n):
+    return (Qmax * KL * Ce**n) / (1 + KL * Ce**n)
+# Dosis efectiva de Fe (normalizada)
+dosis_Fe = 0.004368  # g/L (equivalente a 4.368 mg/L)
+Co = 10.0            # µg/L (límite OMS)
+print(f"{'='*70}")
+print(f"REMOCIÓN DE As(V) A 10 µg/L - Dosis efectiva de Fe: {dosis_Fe*1000:.3f} mg/L")
+print(f"{'='*70}")
+resultados = []
+for cond, Qmax, KL, n in [
+    ('DI',      103.3,   0.02771,  0.5238),
+    ('NaCl',     59.3,   0.05756,  0.6193),
+    ('Natural',  87.6,   0.001769, 0.8629)
+]:
+    # Capacidad máxima teórica del sistema
+    q_max_sistema = Qmax * dosis_Fe  # µg/L
+    # Balance de masa: (Co - Ce)/dosis = Qmax*KL*Ce^n/(1+KL*Ce^n)
+    def balance(Ce):
+        if Ce <= 0:
+            return Co / dosis_Fe  # valor grande positivo
+        q_balance = (Co - Ce) / dosis_Fe
+        q_sips = sips(Ce, Qmax, KL, n)
+        return q_balance - q_sips
+    # Resolver (Ce debe estar entre 0 y Co)
+    Ce_eq = fsolve(balance, Co * 0.9)[0]  # valor inicial cercano a Co
+    Ce_eq = max(0, min(Ce_eq, Co))  # acotar
+    q_ads = (Co - Ce_eq) / dosis_Fe  # µg/g(Fe) adsorbido real
+    remocion = (Co - Ce_eq) / Co * 100
+    resultados.append({
+        'cond': cond,
+        'Qmax': Qmax,
+        'KL': KL,
+        'n': n,
+        'q_max_sistema': q_max_sistema,
+        'Ce_eq': Ce_eq,
+        'q_ads': q_ads,
+        'remocion': remocion
+    })
+    print(f"\n{cond}:")
+    print(f"  Capacidad máx. teórica del sistema: {q_max_sistema:.3f} µg/L")
+    print(f"  Ce en equilibrio:                   {Ce_eq:.3f} µg/L")
+    print(f"  q adsorbido real:                   {q_ads:.3f} µg/g(Fe)")
+    print(f"  % Remoción:                         {remocion:.2f}%")
+# Resumen en tabla
+print(f"\n{'='*70}")
+print(f"{'Condición':<10} {'Qmax(µg/g)':<12} {'KL(L/µg)':<10} {'q_max_sis':<10} {'Ce(µg/L)':<10} {'Remoción':<10}")
+print(f"{'-'*70}")
+for r in resultados:
+    print(f"{r['cond']:<10} {r['Qmax']:<12.1f} {r['KL']:<10.4f} {r['q_max_sistema']:<10.3f} {r['Ce_eq']:<10.3f} {r['remocion']:<10.2f}%")
 # ═════════════ 7. MAIN ═════════════
 if __name__ == "__main__":
     CSV_PATH = r"DatosIsoterma-DI.csv"
@@ -713,92 +809,7 @@ if __name__ == "__main__":
     # Graficar el modelo específico (cambiar según el modelo seleccionado)
     modelo_principal = list(mejores.values())[0]  # Usar el modelo de la primera condición
     graficar_modelo(df_stats, res_por_cond, modelo_principal)
-    
+    graficar_residuos(df_stats, res_por_cond, mejores)
     print("\n✅ ANÁLISIS COMPLETADO")
 
 
-    R = 8.314  # J/(mol·K)
-    T = 298.15  # K
-
-    KL_DI = 0.02771  # L/µg
-    KL_NaCl = 0.05756
-    KL_Natural = 0.001769
-
-    # Convertir a L/mol (masa molar As = 74.92 g/mol)
-    factor = 74.92 * 1e6  # µg/g → g/mol
-
-    KL_DI_mol = KL_DI * factor
-    KL_NaCl_mol = KL_NaCl * factor
-    KL_Natural_mol = KL_Natural * factor
-
-    # Energía libre de adsorción
-    dG_DI = -R * T * np.log(KL_DI_mol)
-    dG_NaCl = -R * T * np.log(KL_NaCl_mol)
-    dG_Natural = -R * T * np.log(KL_Natural_mol)
-
-    print(f"ΔG° adsorción:")
-    print(f"  DI:      {dG_DI/1000:.2f} kJ/mol")
-    print(f"  NaCl:    {dG_NaCl/1000:.2f} kJ/mol")
-    print(f"  Natural: {dG_Natural/1000:.2f} kJ/mol")
-
-    from scipy.optimize import fsolve
-    import numpy as np
-
-    def sips(Ce, Qmax, KL, n):
-        return (Qmax * KL * Ce**n) / (1 + KL * Ce**n)
-
-    # Dosis efectiva de Fe (normalizada)
-    dosis_Fe = 0.004368  # g/L (equivalente a 4.368 mg/L)
-    Co = 10.0            # µg/L (límite OMS)
-
-    print(f"{'='*70}")
-    print(f"REMOCIÓN DE As(V) A 10 µg/L - Dosis efectiva de Fe: {dosis_Fe*1000:.3f} mg/L")
-    print(f"{'='*70}")
-
-    resultados = []
-    for cond, Qmax, KL, n in [
-        ('DI',      103.3,   0.02771,  0.5238),
-        ('NaCl',     59.3,   0.05756,  0.6193),
-        ('Natural',  87.6,   0.001769, 0.8629)
-    ]:
-        # Capacidad máxima teórica del sistema
-        q_max_sistema = Qmax * dosis_Fe  # µg/L
-
-        # Balance de masa: (Co - Ce)/dosis = Qmax*KL*Ce^n/(1+KL*Ce^n)
-        def balance(Ce):
-            if Ce <= 0:
-                return Co / dosis_Fe  # valor grande positivo
-            q_balance = (Co - Ce) / dosis_Fe
-            q_sips = sips(Ce, Qmax, KL, n)
-            return q_balance - q_sips
-
-        # Resolver (Ce debe estar entre 0 y Co)
-        Ce_eq = fsolve(balance, Co * 0.9)[0]  # valor inicial cercano a Co
-        Ce_eq = max(0, min(Ce_eq, Co))  # acotar
-
-        q_ads = (Co - Ce_eq) / dosis_Fe  # µg/g(Fe) adsorbido real
-        remocion = (Co - Ce_eq) / Co * 100
-
-        resultados.append({
-            'cond': cond,
-            'Qmax': Qmax,
-            'KL': KL,
-            'n': n,
-            'q_max_sistema': q_max_sistema,
-            'Ce_eq': Ce_eq,
-            'q_ads': q_ads,
-            'remocion': remocion
-        })
-
-        print(f"\n{cond}:")
-        print(f"  Capacidad máx. teórica del sistema: {q_max_sistema:.3f} µg/L")
-        print(f"  Ce en equilibrio:                   {Ce_eq:.3f} µg/L")
-        print(f"  q adsorbido real:                   {q_ads:.3f} µg/g(Fe)")
-        print(f"  % Remoción:                         {remocion:.2f}%")
-
-    # Resumen en tabla
-    print(f"\n{'='*70}")
-    print(f"{'Condición':<10} {'Qmax(µg/g)':<12} {'KL(L/µg)':<10} {'q_max_sis':<10} {'Ce(µg/L)':<10} {'Remoción':<10}")
-    print(f"{'-'*70}")
-    for r in resultados:
-        print(f"{r['cond']:<10} {r['Qmax']:<12.1f} {r['KL']:<10.4f} {r['q_max_sistema']:<10.3f} {r['Ce_eq']:<10.3f} {r['remocion']:<10.2f}%")
