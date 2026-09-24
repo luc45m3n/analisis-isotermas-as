@@ -7,6 +7,12 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.odr import ODR, Model, RealData
 from scipy.stats import t as student_t
+from scipy.optimize import fsolve
+from scipy.optimize import brentq
+ 
+R_GAS = 8.314    # J/(mol·K)
+T_K   = 298.15   # K
+M_AS  = 74.92    # g/mol (As total)
 
 plt.rcParams.update({"font.family": "serif", "font.size": 10,
                      "axes.labelsize": 11, "axes.titlesize": 12})
@@ -704,75 +710,76 @@ def graficar_residuos(df_stats, res_por_cond, mejores):
     plt.savefig('residuos_modelo.png', dpi=300)
     plt.show()
 
-R = 8.314  # J/(mol·K)
-T = 298.15  # K
-KL_DI = 0.02771  # L/µg
-KL_NaCl = 0.05756
-KL_Natural = 0.001769
-# Convertir a L/mol (masa molar As = 74.92 g/mol)
-factor = 74.92 * 1e6  # µg/g → g/mol
-KL_DI_mol = KL_DI * factor
-KL_NaCl_mol = KL_NaCl * factor
-KL_Natural_mol = KL_Natural * factor
-# Energía libre de adsorción
-dG_DI = -R * T * np.log(KL_DI_mol)
-dG_NaCl = -R * T * np.log(KL_NaCl_mol)
-dG_Natural = -R * T * np.log(KL_Natural_mol)
-print(f"ΔG° adsorción:")
-print(f"  DI:      {dG_DI/1000:.2f} kJ/mol")
-print(f"  NaCl:    {dG_NaCl/1000:.2f} kJ/mol")
-print(f"  Natural: {dG_Natural/1000:.2f} kJ/mol")
-from scipy.optimize import fsolve
-import numpy as np
-def sips(Ce, Qmax, KL, n):
-    return (Qmax * KL * Ce**n) / (1 + KL * Ce**n)
-# Dosis efectiva de Fe (normalizada)
-dosis_Fe = 0.004368  # g/L (equivalente a 4.368 mg/L)
-Co = 10.0            # µg/L (límite OMS)
-print(f"{'='*70}")
-print(f"REMOCIÓN DE As(V) A 10 µg/L - Dosis efectiva de Fe: {dosis_Fe*1000:.3f} mg/L")
-print(f"{'='*70}")
-resultados = []
-for cond, Qmax, KL, n in [
-    ('DI',      103.3,   0.02771,  0.5238),
-    ('NaCl',     59.3,   0.05756,  0.6193),
-    ('Natural',  87.6,   0.001769, 0.8629)
-]:
-    # Capacidad máxima teórica del sistema
-    q_max_sistema = Qmax * dosis_Fe  # µg/L
-    # Balance de masa: (Co - Ce)/dosis = Qmax*KL*Ce^n/(1+KL*Ce^n)
-    def balance(Ce):
-        if Ce <= 0:
-            return Co / dosis_Fe  # valor grande positivo
-        q_balance = (Co - Ce) / dosis_Fe
-        q_sips = sips(Ce, Qmax, KL, n)
-        return q_balance - q_sips
-    # Resolver (Ce debe estar entre 0 y Co)
-    Ce_eq = fsolve(balance, Co * 0.9)[0]  # valor inicial cercano a Co
-    Ce_eq = max(0, min(Ce_eq, Co))  # acotar
-    q_ads = (Co - Ce_eq) / dosis_Fe  # µg/g(Fe) adsorbido real
-    remocion = (Co - Ce_eq) / Co * 100
-    resultados.append({
-        'cond': cond,
-        'Qmax': Qmax,
-        'KL': KL,
-        'n': n,
-        'q_max_sistema': q_max_sistema,
-        'Ce_eq': Ce_eq,
-        'q_ads': q_ads,
-        'remocion': remocion
-    })
-    print(f"\n{cond}:")
-    print(f"  Capacidad máx. teórica del sistema: {q_max_sistema:.3f} µg/L")
-    print(f"  Ce en equilibrio:                   {Ce_eq:.3f} µg/L")
-    print(f"  q adsorbido real:                   {q_ads:.3f} µg/g(Fe)")
-    print(f"  % Remoción:                         {remocion:.2f}%")
-# Resumen en tabla
-print(f"\n{'='*70}")
-print(f"{'Condición':<10} {'Qmax(µg/g)':<12} {'KL(L/µg)':<10} {'q_max_sis':<10} {'Ce(µg/L)':<10} {'Remoción':<10}")
-print(f"{'-'*70}")
-for r in resultados:
-    print(f"{r['cond']:<10} {r['Qmax']:<12.1f} {r['KL']:<10.4f} {r['q_max_sistema']:<10.3f} {r['Ce_eq']:<10.3f} {r['remocion']:<10.2f}%")
+# ═══════════════════════════════════════════════════════════════
+# ΔG° de adsorción, tomado de la KL del modelo ganador
+# ═══════════════════════════════════════════════════════════════
+def calcular_dG_adsorcion(res_por_cond, mejores, unidad_conc='ug/L'):
+    """
+    Calcula ΔG° = -RT ln(KL_mol) usando la KL del modelo ganador de CADA
+    condición (Langmuir, Sips, Khan y LF_hybrid tienen 'KL'; Freundlich,
+    Halsey y Redlich-Peterson no, y se informan como no aplicables).
+ 
+    unidad_conc: 'ug/L' o 'mg/L' -- define el factor de conversión de KL
+    a L/mol. Usá la MISMA unidad con la que se ajustó Ce, si no el ΔG°
+    queda mal escalado (ver nota de unidades en el chat).
+    """
+    factor_masa = M_AS * 1e6 if unidad_conc == 'ug/L' else M_AS  # µg/mol o g/mol
+    resultados = {}
+    print(f"\n{'='*60}\nΔG° de adsorción (a partir del ajuste real)\n{'='*60}")
+    for cond, nombre in mejores.items():
+        r = res_por_cond[cond][nombre]
+        if 'KL' not in r['params']:
+            print(f"⚠ {cond}: modelo ganador ({nombre}) sin KL → ΔG° no calculado")
+            continue
+        KL = r['params']['KL']
+        KL_mol = KL * factor_masa
+        dG = -R_GAS * T_K * np.log(KL_mol)  # J/mol
+        resultados[cond] = dict(modelo=nombre, KL=KL, KL_mol=KL_mol, dG_kJmol=dG / 1000)
+        print(f"  {cond:<10} ({nombre}): KL={KL:.5g}  →  ΔG° = {dG/1000:.2f} kJ/mol")
+    return resultados
+
+
+# ═══════════════════════════════════════════════════════════════
+# % remoción, resolviendo el balance de masa con la
+# función de isoterma real (no una copia hardcodeada de Sips)
+# ═══════════════════════════════════════════════════════════════
+def calcular_remocion(res_por_cond, mejores, Co, dosis_adsorbente):
+    """
+    Resuelve (Co - Ce)/dosis = q_modelo(Ce) usando r['func'] y r['popt']
+    tal como salieron del ODR -- funciona para cualquier modelo ganador,
+    no solo Sips. Usa brentq (con chequeo de raíz) en vez de fsolve para
+    no fallar en silencio si no hay solución en [0, Co].
+    """
+    resultados = []
+    print(f"\n{'='*60}\nRemoción estimada a Co={Co}, dosis={dosis_adsorbente}\n{'='*60}")
+    for cond, nombre in mejores.items():
+        r = res_por_cond[cond][nombre]
+        func, popt = r['func'], r['popt']
+ 
+        def balance(Ce):
+            if Ce <= 0:
+                return Co / dosis_adsorbente
+            return (Co - Ce) / dosis_adsorbente - func(Ce, *popt)
+ 
+        eps = 1e-9
+        try:
+            f_lo, f_hi = balance(eps), balance(Co)
+            if f_lo * f_hi > 0:
+                raise ValueError("sin cambio de signo")
+            Ce_eq = brentq(balance, eps, Co, xtol=1e-8)
+        except ValueError:
+            print(f"⚠ {cond}: no se encontró raíz en [0, Co] "
+                  f"(revisar dosis/Co o el modelo {nombre})")
+            continue
+ 
+        q_ads = (Co - Ce_eq) / dosis_adsorbente
+        remocion = (Co - Ce_eq) / Co * 100
+        resultados.append(dict(cond=cond, modelo=nombre, Ce_eq=Ce_eq,
+                                q_ads=q_ads, remocion=remocion))
+        print(f"  {cond:<10} ({nombre}): Ce_eq={Ce_eq:.4f}  q_ads={q_ads:.3f}  "
+              f"remoción={remocion:.2f}%")
+    return resultados
+
 # ═════════════ 7. MAIN ═════════════
 if __name__ == "__main__":
     CSV_PATH = r"DatosIsoterma-DI.csv"
@@ -808,8 +815,12 @@ if __name__ == "__main__":
     
     # Graficar el modelo específico (cambiar según el modelo seleccionado)
     modelo_principal = list(mejores.values())[0]  # Usar el modelo de la primera condición
-    graficar_modelo(df_stats, res_por_cond, modelo_principal)
+    #graficar_modelo(df_stats, res_por_cond, modelo_principal)
     graficar_residuos(df_stats, res_por_cond, mejores)
+
+    dG_resultados       = calcular_dG_adsorcion(res_por_cond, mejores, unidad_conc='ug/L')
+    remocion_resultados = calcular_remocion(res_por_cond, mejores, Co=10.0, dosis_adsorbente=0.004368)
+
     print("\n✅ ANÁLISIS COMPLETADO")
 
 
