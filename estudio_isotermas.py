@@ -14,12 +14,25 @@ R_GAS = 8.314    # J/(mol·K)
 T_K   = 298.15   # K
 M_AS  = 74.92    # g/mol (As total)
 
+UNIDAD_CE = "µg/L"     # ppb
+UNIDAD_QE = "µg/mg"    # numéricamente = mg/g
+
+# ---------- Parámetros del ensayo batch ----------
+MASA_MATERIAL_MG = 3.12        # mg totales pesados (la misma masa con que se calculó Qe)
+VOLUMEN_L        = 0.025       # 25 mL = 0.025 L
+DOSIS_MG_POR_L   = MASA_MATERIAL_MG / VOLUMEN_L   # = 124.8 mg/L
+
+# Límite OMS para As en agua de consumo
+CO_OBJETIVO_UGL = 10.0
+
+CS_BET    = 2000.0     # ← solo si reincorporás BET
+MOSTRAR   = True       # False para batch sin ventanas
+
 plt.rcParams.update({"font.family": "serif", "font.size": 10,
                      "axes.labelsize": 11, "axes.titlesize": 12})
 
-UNIDAD_CE = "mg/L"     # ← ajustá si es µg/L
-CS_BET    = 2000.0     # ← solo si reincorporás BET con valor físico
-MOSTRAR   = True       # False para batch sin ventanas
+
+
 
 # ═════════════ 1. MODELOS ═════════════
 def langmuir(Ce, Qmax, KL):       return (Qmax*KL*Ce)/(1 + KL*Ce)
@@ -155,26 +168,49 @@ def agregar_bootstrap(res_por_cond, df_ajuste, mejores, B=500):
 def cargar_y_agrupar_replicas(csv_path, tolerancia_co=0.01):
     """
     Carga datos con estructura:
-    - 3 condiciones (DI, NaCl, Natural)
-    - 7 réplicas (falcones) por condición
-    - 3 mediciones FIASS por réplica
-    Total: 63 filas por condición × 3 condiciones = 189 filas (o 63 si solo hay 1 condición)
+    - condicion, co, replica, medicion_fiass, ce, masa_mg, v_ml, Qe
+    - Recalcula Qe = (Co - Ce) * V / m  [µg/L * L / mg = µg/mg ≡ mg/g]
     """
-    df = pd.read_csv(csv_path, sep=";", decimal=".",comment='#')
+    df = pd.read_csv(csv_path, sep=";", decimal=".", comment='#')
     df.columns = [c.strip().lower() for c in df.columns]
-    df.rename(columns={'simga_co': 'sigma_co', 'simga_ce': 'sigma_ce', 'simga_qe': 'sigma_qe',
-                       'ce': 'Ce', 'qe': 'Qe', 'co': 'Co'}, inplace=True)
+    
+    print(f"Columnas detectadas: {list(df.columns)}")
+    
+    # ═══════ VERIFICAR COLUMNAS NECESARIAS (todavía en minúscula) ═══════
+    columnas_necesarias = ['co', 'ce', 'v_ml', 'masa_mg']
+    faltantes = [c for c in columnas_necesarias if c not in df.columns]
+    
+    if faltantes:
+        raise ValueError(f"❌ Faltan columnas en el CSV: {faltantes}\n"
+                        f"   Columnas encontradas: {list(df.columns)}")
+    
+    # ═══════ RECALCULO DE Qe CON MASA TOTAL ═══════
+    # Qe = (Co - Ce) * V / m   [µg/L * L / mg = µg/mg]
+    df['qe'] = (df['co'] - df['ce']) * (df['v_ml'] / 1000.0) / df['masa_mg']
+    print(f"✓ Qe recalculado: (Co - Ce) × V / m")
+    print(f"  Rango de masa: {df['masa_mg'].min():.3f} - {df['masa_mg'].max():.3f} mg")
+    print(f"  Volumen: {df['v_ml'].unique()} mL")
+    
+    # ═══════ RENOMBRAR A MAYÚSCULAS PARA CONSISTENCIA ═══════
+    df.rename(columns={
+        'simga_co': 'sigma_co', 
+        'simga_ce': 'sigma_ce', 
+        'simga_qe': 'sigma_qe',
+        'ce': 'Ce', 
+        'qe': 'Qe', 
+        'co': 'Co',
+        'masa_mg': 'masa_mg',  # ya está bien
+        'v_ml': 'v_ml'         # ya está bien
+    }, inplace=True)
     
     # Detectar columna de condición
     if 'condicion' in df.columns:
-        pass  # ya existe
+        pass
     elif 'ph' in df.columns:
         df['condicion'] = df['ph'].apply(lambda x: f'pH_{x}')
     elif 'matriz' in df.columns:
         df['condicion'] = df['matriz']
     else:
-        # Si no hay columna de condición, intentar inferirla del rango de filas
-        # Asumir que cada 21 filas es una condición diferente
         n_filas = len(df)
         if n_filas == 63:
             df['condicion'] = ['DI']*21 + ['NaCl']*21 + ['Natural']*21
@@ -182,12 +218,11 @@ def cargar_y_agrupar_replicas(csv_path, tolerancia_co=0.01):
             df['condicion'] = ['condicion_1']*21
         else:
             df['condicion'] = 'condicion_1'
-        print(f"⚠ Columna de condición no encontrada. Asignada automáticamente: {df['condicion'].unique()}")
+        print(f"⚠ Columna de condición no encontrada. Asignada: {df['condicion'].unique()}")
     
-    # Verificar columnas críticas
     if 'replica' not in df.columns:
         raise ValueError("❌ Columna 'replica' no encontrada")
-    
+        
     # Corregir medicion_fiass: debe ser 1, 2, 3 dentro de cada réplica
     # No un contador global
     df = df.sort_values(['condicion', 'replica', 'medicion_fiass']).reset_index(drop=True)
@@ -430,12 +465,8 @@ def imprimir_tabla_por_condicion(res_por_cond):
 
 def seleccionar_mejores_modelos(res_por_cond, modelo_fijo=None):
     """
-    Selecciona el mejor modelo para la primera condición (DI) y lo fuerza para las demás.
-    
-    Args:
-        res_por_cond: diccionario con resultados por condición
-        modelo_fijo: nombre del modelo a usar para todas las condiciones. 
-                     Si es None, selecciona automáticamente el mejor para DI.
+    Selecciona el mejor modelo INDEPENDIENTEMENTE para cada condición.
+    No fuerza el mismo modelo en todas las condiciones.
     """
     mejores = {}
     
@@ -444,49 +475,30 @@ def seleccionar_mejores_modelos(res_por_cond, modelo_fijo=None):
                            key=lambda x: (0 if 'DI' in x or 'di' in x else 
                                          1 if 'NaCl' in x or 'nacl' in x else 2))
     
-    for i, cond in enumerate(cond_ordenadas):
+    for cond in cond_ordenadas:
         resd = res_por_cond[cond]
         
-        if i == 0 or modelo_fijo is None:
-            # Para DI (o si no hay modelo fijo), seleccionar el mejor
-            val = {k: v for k, v in resd.items() 
-                   if v['success'] and v['valido'] and np.isfinite(v.get('AICc', np.nan))}
-            
-            if not val:
-                print(f"❌ {cond}: sin modelos válidos")
-                continue
-            
-            # Ordenar por AICc
-            orden = sorted(val, key=lambda k: val[k]['AICc'])
-            amin = val[orden[0]]['AICc']
-            
-            # Seleccionar el mejor (AICc más bajo, preferir modelos más simples si ΔAICc < 2)
-            candidatos = [k for k in orden if val[k]['AICc'] - amin < 2]
-            mejor = min(candidatos, key=lambda k: len(val[k]['popt']))
-            
-            if i == 0:
-                modelo_fijo = mejor  # Guardar para usar en las otras condiciones
-                print(f"\n Modelo seleccionado para todas las condiciones: {mejor}")
-                print(f"   (AICc={val[mejor]['AICc']:.2f}, χ²/dof={val[mejor]['chi2_red']:.3f}, R²={val[mejor]['R2']:.4f})")
-        else:
-            # Para las otras condiciones, usar el modelo fijo
-            mejor = modelo_fijo
+        # Seleccionar el mejor modelo para ESTA condición
+        val = {k: v for k, v in resd.items() 
+               if v['success'] and v['valido'] and np.isfinite(v.get('AICc', np.nan))
+               and v['R2'] > 0.7}
         
-        if mejor not in resd or not resd[mejor]['success']:
-            print(f" {cond}: {mejor} no está disponible o no convergió")
-            # Buscar alternativa
-            val = {k: v for k, v in resd.items() 
-                   if v['success'] and v['valido'] and np.isfinite(v.get('AICc', np.nan))}
-            if val:
-                mejor = min(val, key=lambda k: val[k]['AICc'])
-                print(f"   → Usando alternativa: {mejor}")
-            else:
-                print(f"   ❌ Sin modelos disponibles para {cond}")
-                continue
+        if not val:
+            print(f" {cond}: sin modelos válidos")
+            continue
+        
+        # Ordenar por AICc
+        orden = sorted(val, key=lambda k: val[k]['AICc'])
+        amin = val[orden[0]]['AICc']
+        
+        # Candidatos dentro de ΔAICc < 2
+        candidatos = [k for k in orden if val[k]['AICc'] - amin < 2]
+        # Preferir el más simple (menos parámetros)
+        mejor = min(candidatos, key=lambda k: len(val[k]['popt']))
         
         mejores[cond] = mejor
-        r = resd[mejor]
-        print(f"   {cond}: {mejor} (AICc={r['AICc']:.2f}, χ²/dof={r['chi2_red']:.3f}, R²={r['R2']:.4f})")
+        r = val[mejor]
+        print(f"  {cond}: {mejor} (AICc={r['AICc']:.2f}, χ²/dof={r['chi2_red']:.3f}, R²={r['R2']:.4f})")
     
     return mejores
 
@@ -525,6 +537,62 @@ def graficar_ajustes_por_condicion(df_stats, res_por_cond, mejores):
     ax.set_xlabel(f'$C_e$ ({UNIDAD_CE})'); ax.set_ylabel('$q_e$ (mg/g)')
     ax.legend(fontsize=9, ncol=2); ax.grid(ls='--', alpha=.5)
     guardar_fig('ajustes_desvio_real.png')
+
+def graficar_isotermas_por_condicion(df_stats, res_por_cond, mejores):
+    """
+    Gráfico separado por condición, cada uno con su modelo ganador.
+    """
+    condiciones = sorted(mejores.keys())
+    n_cond = len(condiciones)
+    
+    fig, axes = plt.subplots(1, n_cond, figsize=(7*n_cond, 6), sharey=True)
+    if n_cond == 1:
+        axes = [axes]
+    
+    colores = {'DI': '#1f77b4', 'NaCl': '#2ca02c', 'Natural': '#d62728'}
+    labels = {'DI': 'DI (agua desionizada)', 
+              'NaCl': 'NaCl 0.01 M', 
+              'Natural': 'Agua natural'}
+    
+    # Calcular rango Y común (sin envolver en max())
+    y_max = df_stats[df_stats['condicion'].isin(condiciones)]['Qe_mean'].max() * 1.15
+    
+    for ax, cond in zip(axes, condiciones):
+        sub = df_stats[df_stats['condicion'] == cond]
+        color = colores.get(cond, 'gray')
+        
+        # Datos experimentales
+        ax.errorbar(sub['Ce_mean'], sub['Qe_mean'], 
+                    xerr=sub['Ce_std'], yerr=sub['Qe_std'],
+                    fmt='o', color=color, ms=8, capsize=4, 
+                    label='Datos experimentales', zorder=5, alpha=0.9)
+        
+        # Modelo ganador
+        mejor = mejores[cond]
+        r = res_por_cond[cond][mejor]
+        Ce_curve = np.linspace(0, sub['Ce_mean'].max() * 1.1, 500)
+        Qe_curve = r['func'](Ce_curve, *r['popt'])
+        
+        # Construir etiqueta con parámetros
+        params_str = ', '.join([f'{k}={v:.3g}' for k, v in r['params'].items()])
+        ax.plot(Ce_curve, Qe_curve, '-', color=color, lw=2.5,
+                label=f'{mejor}: R²={r["R2"]:.3f}\n({params_str})',
+                alpha=0.85)
+        
+        ax.set_xlabel('$C_e$ (µg/L)', fontsize=12)
+        ax.set_title(labels.get(cond, cond), fontsize=13, fontweight='bold')
+        ax.legend(fontsize=9, loc='lower right', framealpha=0.9)
+        ax.grid(ls='--', alpha=0.4)
+        ax.set_ylim(0, y_max)
+    
+    axes[0].set_ylabel('$q_e$ (µg/mg)', fontsize=12)
+    
+    plt.tight_layout()
+    plt.savefig('isotermas_modelos_ganadores.png', dpi=300, bbox_inches='tight')
+    print("📊 Guardado: isotermas_modelos_ganadores.png")
+    if MOSTRAR:
+        plt.show()
+    plt.close('all')
 
 def graficar_modelo(df_stats, res_por_cond, modelo):
     for cond, resd in res_por_cond.items():
@@ -633,59 +701,86 @@ def graficar_cv(df_stats):
     plt.close('all')
 
 def comparar_parametros_entre_condiciones(res_por_cond, mejores):
-    """Compara los parámetros del mismo modelo entre diferentes condiciones."""
+    """Compara parámetros físicos entre condiciones, aunque los modelos sean diferentes."""
     print(f"\n{'='*100}")
-    print("📊 COMPARACIÓN DE PARÁMETROS ENTRE CONDICIONES")
+    print(" COMPARACIÓN DE MODELOS Y PARÁMETROS ENTRE CONDICIONES")
     print(f"{'='*100}")
     
-    # Obtener todos los parámetros únicos
-    todos_params = set()
-    for cond, nombre in mejores.items():
-        if nombre in res_por_cond[cond]:
-            todos_params.update(res_por_cond[cond][nombre]['params'].keys())
+    print("\n Modelos ganadores:")
+    for cond, modelo in mejores.items():
+        r = res_por_cond[cond][modelo]
+        print(f"  {cond}: {modelo} (R²={r['R2']:.4f}, AICc={r['AICc']:.2f})")
     
-    todos_params = sorted(list(todos_params))
-    
-    # Imprimir tabla comparativa
-    condiciones = sorted(mejores.keys())
-    header = f"{'Parámetro':<15}" + "".join([f"{cond:>20}" for cond in condiciones])
-    print(f"\n{header}")
-    print("─" * len(header))
-    
-    for param in todos_params:
-        fila = f"{param:<15}"
-        for cond in condiciones:
-            nombre = mejores[cond]
-            if nombre in res_por_cond[cond] and param in res_por_cond[cond][nombre]['params']:
-                val = res_por_cond[cond][nombre]['params'][param]
-                err = res_por_cond[cond][nombre]['params_err'].get(param, 0)
-                fila += f"{val:.4f} ± {err:.4f}  "
+    # --- Capacidad máxima (Qmax) ---
+    print(f"\n{'='*100}")
+    print("📈 CAPACIDAD MÁXIMA (Qmax)")
+    print(f"{'='*100}")
+    for cond, modelo in mejores.items():
+        r = res_por_cond[cond][modelo]
+        if 'Qmax' in r['params']:
+            qmax = r['params']['Qmax']
+            boot_ci = r.get('boot_ci', {}).get('Qmax', None)
+            if boot_ci:
+                print(f"  {cond} ({modelo}): Qmax = {qmax:.3f} µg/mg  [boot IC 95%: {boot_ci[0]:.3f}, {boot_ci[1]:.3f}]")
             else:
-                fila += "N/A".rjust(20)
-        print(fila)
+                err = r['params_err'].get('Qmax', 0)
+                print(f"  {cond} ({modelo}): Qmax = {qmax:.3f} ± {err:.3f} µg/mg")
+        else:
+            print(f"  {cond} ({modelo}): Qmax no definido (modelo sin saturación asintótica)")
     
-    # Análisis de tendencias
-    print(f"\n📈 ANÁLISIS DE TENDENCIAS:")
-    print(f"{'─'*100}")
+    # --- Exponente de heterogeneidad ---
+    print(f"\n{'='*100}")
+    print("📌 EXPONENTE DE HETEROGENEIDAD (n, β, m)")
+    print(f"{'='*100}")
+    for cond, modelo in mejores.items():
+        r = res_por_cond[cond][modelo]
+        for param in ['n', 'beta', 'm']:
+            if param in r['params']:
+                val = r['params'][param]
+                err = r['params_err'].get(param, 0)
+                nombre_param = {'n': 'n (Sips)', 'beta': 'β (Redlich-Peterson)', 'm': 'm (Khan)'}[param]
+                print(f"  {cond} ({modelo}): {nombre_param} = {val:.4f} ± {err:.4f}")
+                if param == 'n' or param == 'beta':
+                    if val < 0.6:
+                        print(f"    → Superficie ALTAMENTE heterogénea")
+                    elif val < 0.85:
+                        print(f"    → Superficie MODERADAMENTE heterogénea")
+                    else:
+                        print(f"    → Superficie casi homogénea (tendiendo a Langmuir)")
+                break
     
-    for param in todos_params:
-        valores = []
-        for cond in condiciones:
-            nombre = mejores[cond]
-            if nombre in res_por_cond[cond] and param in res_por_cond[cond][nombre]['params']:
-                val = res_por_cond[cond][nombre]['params'][param]
-                valores.append((cond, val))
-        
-        if len(valores) >= 2:
-            # Calcular cambio relativo
-            v0 = valores[0][1]
-            if v0 != 0:
-                cambios = [(v[0], (v[1] - v0) / v0 * 100) for v in valores[1:]]
-                print(f"\n{param}:")
-                print(f"  Valor base ({valores[0][0]}): {v0:.4f}")
-                for cond, cambio in cambios:
-                    direccion = "↓" if cambio < 0 else "↑"
-                    print(f"  {cond}: {direccion} {cambio:+.1f}%")
+    # --- Constante de afinidad ---
+    print(f"\n{'='*100}")
+    print("📌 CONSTANTE DE AFINIDAD")
+    print(f"{'='*100}")
+    for cond, modelo in mejores.items():
+        r = res_por_cond[cond][modelo]
+        if 'KL' in r['params']:
+            KL = r['params']['KL']
+            print(f"  {cond} ({modelo}): KL = {KL:.5f} L/µg")
+        elif 'K_RP' in r['params']:
+            K_RP = r['params']['K_RP']
+            a_RP = r['params'].get('a_RP', 0)
+            print(f"  {cond} ({modelo}): K_RP = {K_RP:.5f}, a_RP = {a_RP:.5f}")
+        elif 'Kf' in r['params']:
+            Kf = r['params']['Kf']
+            print(f"  {cond} ({modelo}): Kf = {Kf:.5f}")
+
+def valido_fisico(nombre, p):
+    if not np.all(np.isfinite(p)): return False
+    if nombre == 'Double_Langmuir_ord':
+        Q1, K1, Q2, t = p
+        if not (Q1 > 0 and K1 > 0 and Q2 > 0):
+            return False
+        # Rechazar si Q2 es órdenes de magnitud mayor que Q1 (inestabilidad numérica)
+        if Q2 > 100 * Q1:
+            return False
+    if nombre == 'halsey':
+        return p[1] > 0
+    if nombre == 'LF_hybrid':
+        Qmax, KL, Kf, m = p
+        return Qmax > 0 and KL > 0 and Kf > 0 and m > 0
+    return p[0] > 0 and p[1] > 0
 
 def graficar_residuos(df_stats, res_por_cond, mejores):
     """Residuos vs Ce predicho para el modelo ganador."""
@@ -812,15 +907,21 @@ if __name__ == "__main__":
     # Graficar
     graficar_ajustes_por_condicion(df_stats, res_por_cond, mejores)
     graficar_descomposicion(df_stats, res_por_cond, mejores)
-    
+    graficar_isotermas_por_condicion(df_stats, res_por_cond, mejores)
     # Graficar el modelo específico (cambiar según el modelo seleccionado)
     modelo_principal = list(mejores.values())[0]  # Usar el modelo de la primera condición
     #graficar_modelo(df_stats, res_por_cond, modelo_principal)
     graficar_residuos(df_stats, res_por_cond, mejores)
 
     dG_resultados       = calcular_dG_adsorcion(res_por_cond, mejores, unidad_conc='ug/L')
-    remocion_resultados = calcular_remocion(res_por_cond, mejores, Co=10.0, dosis_adsorbente=0.004368)
+    print(f"\n  Dosis real: {MASA_MATERIAL_MG} mg en {VOLUMEN_L*1000:.0f} mL "
+      f"→ {DOSIS_MG_POR_L:.2f} mg/L")
 
+    remocion_resultados = calcular_remocion(
+        res_por_cond, mejores,
+        Co=CO_OBJETIVO_UGL,
+        dosis_adsorbente=DOSIS_MG_POR_L
+    )
     print("\n✅ ANÁLISIS COMPLETADO")
 
 
